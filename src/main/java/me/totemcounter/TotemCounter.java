@@ -1,5 +1,7 @@
 package me.totemcounter;
 
+import io.papermc.paper.chat.ChatRenderer;
+import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
@@ -7,6 +9,7 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -30,12 +33,20 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
+/**
+ * How counting works:
+ *  - totals:    the REAL number of totems each player has popped (reset only when that player dies).
+ *  - baselines: for each viewer, a snapshot of everyone's totals taken when that viewer ran
+ *               /resettotemcounter.
+ *  - What a viewer sees for a player = total - that viewer's baseline for that player.
+ * So resetting only changes what YOU see. Everyone else keeps seeing their own numbers.
+ */
 public class TotemCounter extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     private static final LegacyComponentSerializer AMP = LegacyComponentSerializer.legacyAmpersand();
 
-    // Every player has their own counter, keyed by UUID.
-    private final Map<UUID, Integer> counts = new HashMap<>();
+    private final Map<UUID, Integer> totals = new HashMap<>();
+    private final Map<UUID, Map<UUID, Integer>> baselines = new HashMap<>();
     // Players who turned their own display off (counting continues).
     private final Set<UUID> hidden = new HashSet<>();
 
@@ -52,6 +63,7 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
         dataFile = new File(getDataFolder(), "data.yml");
         data = YamlConfiguration.loadConfiguration(dataFile);
         globalEnabled = data.getBoolean("global-enabled", true);
+        loadAll();
 
         if (Bukkit.getPluginManager().getPlugin("LuckPerms") != null) {
             luckPerms = new LuckPermsHook(this);
@@ -68,19 +80,14 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
         getCommand("totemcounter").setExecutor(this);
         getCommand("totemcounter").setTabCompleter(this);
 
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            loadPlayer(player);
-            updateDisplay(player);
-        }
+        updateAll();
     }
 
     @Override
     public void onDisable() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            savePlayer(player.getUniqueId());
-            clearDisplay(player);
-        }
+        for (Player player : Bukkit.getOnlinePlayers()) clearDisplay(player);
         data.set("global-enabled", globalEnabled);
+        syncToData();
         saveFile();
     }
 
@@ -92,34 +99,51 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     public void onTotemPop(EntityResurrectEvent event) {
         if (!(event.getEntity() instanceof Player player)) return;
 
-        counts.merge(player.getUniqueId(), 1, Integer::sum);
+        totals.merge(player.getUniqueId(), 1, Integer::sum);
         updateDisplay(player);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
-        // Only the player who died is reset.
-        counts.put(player.getUniqueId(), 0);
+        UUID id = player.getUniqueId();
+        // The player who died starts again from 0, for every viewer.
+        totals.put(id, 0);
+        for (Map<UUID, Integer> viewerBaseline : baselines.values()) {
+            viewerBaseline.remove(id);
+        }
         updateDisplay(player);
     }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        loadPlayer(player);
         // Delay so LuckPerms and other plugins have finished loading the player
         Bukkit.getScheduler().runTaskLater(this, () -> updateDisplay(player), 10L);
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        Player player = event.getPlayer();
-        savePlayer(player.getUniqueId());
+        clearDisplay(event.getPlayer());
+        syncToData();
         saveFile();
-        clearDisplay(player);
-        counts.remove(player.getUniqueId());
-        hidden.remove(player.getUniqueId());
+    }
+
+    /**
+     * Chat: each viewer sees the counter relative to their own reset.
+     * Wraps whatever renderer is already set, so it works alongside other chat plugins.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onChat(AsyncChatEvent event) {
+        if (!viewerWants(null, "chat")) return;
+
+        ChatRenderer previous = event.renderer();
+        event.renderer((source, sourceDisplayName, message, viewer) -> {
+            UUID viewerId = viewer instanceof Player v ? v.getUniqueId() : null;
+            String suffix = getSuffixFor(viewerId, source.getUniqueId());
+            Component name = suffix.isEmpty() ? sourceDisplayName : sourceDisplayName.append(AMP.deserialize(suffix));
+            return previous.render(source, name, message, viewer);
+        });
     }
 
     // ------------------------------------------------------------------
@@ -133,10 +157,12 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
                 msg(sender, "messages.player-only", "&cOnly players can use this command.");
                 return true;
             }
-            // Only resets the sender's own counter.
-            counts.put(player.getUniqueId(), 0);
-            updateDisplay(player);
-            msg(player, "messages.reset", "&aYour totem counter has been reset.");
+            // Reset what YOU see for everyone. Nobody else is affected.
+            Map<UUID, Integer> mine = baselines.computeIfAbsent(player.getUniqueId(), k -> new HashMap<>());
+            mine.clear();
+            mine.putAll(totals);
+            updateAll();
+            msg(player, "messages.reset", "&aReset everyone's totem counter &lfor you&a.");
             return true;
         }
 
@@ -212,25 +238,50 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     }
 
     // ------------------------------------------------------------------
-    // Display
+    // Counting / suffix (used by chat, display and PlaceholderAPI)
     // ------------------------------------------------------------------
 
-    public boolean isShowing(UUID uuid) {
-        return globalEnabled && !hidden.contains(uuid);
+    public boolean isShowing(UUID target) {
+        return globalEnabled && !hidden.contains(target);
     }
 
-    public int getCount(UUID uuid) {
-        return counts.getOrDefault(uuid, 0);
+    /**
+     * Is the counter turned on for this place ("chat", "tab" or "nametag")?
+     * Controlled by the "display:" section in config.yml (chat and tab are off by default).
+     */
+    public boolean viewerWants(UUID viewer, String channel) {
+        return getConfig().getBoolean("display." + channel, channel.equals("nametag"));
     }
 
-    /** The totem suffix as an &-coded string ("" if hidden/disabled). */
-    public String getTotemSuffix(UUID uuid) {
-        if (!isShowing(uuid)) return "";
-        int count = getCount(uuid);
+    /** The real number of pops for a player. */
+    public int getTotal(UUID target) {
+        return totals.getOrDefault(target, 0);
+    }
+
+    /** What "viewer" sees for "target" (total minus the viewer's last reset). */
+    public int getViewCount(UUID viewer, UUID target) {
+        int total = getTotal(target);
+        if (viewer == null) return total;
+        Map<UUID, Integer> base = baselines.get(viewer);
+        int baseline = base == null ? 0 : base.getOrDefault(target, 0);
+        return Math.max(0, total - baseline);
+    }
+
+    /** The &-coded suffix that "viewer" should see on "target" ("" if hidden). viewer may be null. */
+    public String getSuffixFor(UUID viewer, UUID target) {
+        if (!isShowing(target)) return "";
+        return format(getViewCount(viewer, target));
+    }
+
+    private String format(int count) {
         if (count == 0 && getConfig().getBoolean("hide-when-zero", false)) return "";
         return getConfig().getString("suffix-format", " &e[&6%count%&e]")
                 .replace("%count%", String.valueOf(count));
     }
+
+    // ------------------------------------------------------------------
+    // Optional shared display (same number for everyone; off by default)
+    // ------------------------------------------------------------------
 
     public void updateAll() {
         for (Player player : Bukkit.getOnlinePlayers()) updateDisplay(player);
@@ -239,6 +290,10 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     public void updateDisplay(Player player) {
         if (!player.isOnline()) return;
 
+        boolean nametag = getConfig().getBoolean("show-on-nametag", false);
+        boolean tablist = getConfig().getBoolean("show-on-tablist", false);
+        if (!nametag && !tablist) return;
+
         if (!isShowing(player.getUniqueId())) {
             clearDisplay(player);
             return;
@@ -246,10 +301,9 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
 
         String lpPrefix = luckPerms != null ? luckPerms.getPrefix(player) : "";
         String lpSuffix = luckPerms != null ? luckPerms.getSuffix(player) : "";
-        String totemPart = getTotemSuffix(player.getUniqueId());
+        String totemPart = format(getTotal(player.getUniqueId()));
 
-        // Nametag (above head) via a per-player scoreboard team
-        if (getConfig().getBoolean("show-on-nametag", true)) {
+        if (nametag) {
             Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
             String teamName = teamName(player);
             Team team = board.getTeam(teamName);
@@ -260,14 +314,8 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
             team.suffix(AMP.deserialize(lpSuffix + totemPart));
         }
 
-        // Tab list
-        if (getConfig().getBoolean("show-on-tablist", true)) {
+        if (tablist) {
             player.playerListName(AMP.deserialize(lpPrefix + player.getName() + lpSuffix + totemPart));
-        }
-
-        // Display name (used by chat and many other plugins)
-        if (getConfig().getBoolean("show-in-chat", true)) {
-            player.displayName(AMP.deserialize(lpPrefix + player.getName() + lpSuffix + totemPart));
         }
     }
 
@@ -275,8 +323,7 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
         Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
         Team team = board.getTeam(teamName(player));
         if (team != null) team.unregister();
-        player.playerListName(null);
-        player.displayName(null);
+        if (getConfig().getBoolean("show-on-tablist", false)) player.playerListName(null);
     }
 
     private String teamName(Player player) {
@@ -288,15 +335,55 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     // Persistence
     // ------------------------------------------------------------------
 
-    private void loadPlayer(Player player) {
-        UUID id = player.getUniqueId();
-        counts.put(id, data.getInt("counts." + id, 0));
-        if (data.getBoolean("hidden." + id, false)) hidden.add(id);
-        else hidden.remove(id);
+    private void loadAll() {
+        ConfigurationSection counts = data.getConfigurationSection("counts");
+        if (counts != null) {
+            for (String key : counts.getKeys(false)) {
+                try {
+                    totals.put(UUID.fromString(key), counts.getInt(key));
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+        }
+
+        ConfigurationSection bases = data.getConfigurationSection("baselines");
+        if (bases != null) {
+            for (String viewerKey : bases.getKeys(false)) {
+                ConfigurationSection vs = bases.getConfigurationSection(viewerKey);
+                if (vs == null) continue;
+                try {
+                    Map<UUID, Integer> map = new HashMap<>();
+                    for (String targetKey : vs.getKeys(false)) {
+                        map.put(UUID.fromString(targetKey), vs.getInt(targetKey));
+                    }
+                    baselines.put(UUID.fromString(viewerKey), map);
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+        }
+
+        ConfigurationSection hid = data.getConfigurationSection("hidden");
+        if (hid != null) {
+            for (String key : hid.getKeys(false)) {
+                try {
+                    if (hid.getBoolean(key)) hidden.add(UUID.fromString(key));
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+        }
     }
 
-    private void savePlayer(UUID uuid) {
-        data.set("counts." + uuid, counts.getOrDefault(uuid, 0));
+    private void syncToData() {
+        data.set("counts", null);
+        for (Map.Entry<UUID, Integer> e : totals.entrySet()) {
+            data.set("counts." + e.getKey(), e.getValue());
+        }
+        data.set("baselines", null);
+        for (Map.Entry<UUID, Map<UUID, Integer>> viewer : baselines.entrySet()) {
+            for (Map.Entry<UUID, Integer> target : viewer.getValue().entrySet()) {
+                data.set("baselines." + viewer.getKey() + "." + target.getKey(), target.getValue());
+            }
+        }
     }
 
     private void saveFile() {
