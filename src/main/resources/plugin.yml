@@ -1,0 +1,18 @@
+name: TotemCounter
+version: 1.0.0
+main: me.totemcounter.TotemCounter
+api-version: "1.20"
+softdepend: [LuckPerms]
+description: Shows how many totems each player has popped as a name suffix.
+
+commands:
+  resettotemcounter:
+    description: Reset your own totem pop counter.
+    usage: /resettotemcounter
+    permission: totemcounter.reset
+    aliases: [rtc]
+
+permissions:
+  totemcounter.reset:
+    description: Allows resetting your own totem counter.
+    default: true
