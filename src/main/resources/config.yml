@@ -8,7 +8,15 @@ hide-when-zero: false
 # Where the suffix is shown
 show-on-nametag: true
 show-on-tablist: true
+# Sets the player's display name, which the default chat and many plugins use.
+# Turn this off if your chat plugin already shows the LuckPerms suffix and you get doubles.
+show-in-chat: true
 
 messages:
   reset: "&aYour totem counter has been reset."
   player-only: "&cOnly players can use this command."
+  no-permission: "&cYou don't have permission."
+  toggle-on: "&aYour totem counter is now &lvisible&a."
+  toggle-off: "&eYour totem counter is now &lhidden&e (still counting)."
+  global-on: "&aTotem counters are now &lenabled&a for everyone."
+  global-off: "&eTotem counters are now &ldisabled&e for everyone."
