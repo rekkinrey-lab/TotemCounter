@@ -6,6 +6,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -21,16 +22,24 @@ import org.bukkit.scoreboard.Team;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
-public class TotemCounter extends JavaPlugin implements Listener, CommandExecutor {
+public class TotemCounter extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
-    private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacyAmpersand();
+    private static final LegacyComponentSerializer AMP = LegacyComponentSerializer.legacyAmpersand();
 
     // Every player has their own counter, keyed by UUID.
     private final Map<UUID, Integer> counts = new HashMap<>();
+    // Players who turned their own display off (counting continues).
+    private final Set<UUID> hidden = new HashSet<>();
+
+    private boolean globalEnabled = true;
 
     private File dataFile;
     private YamlConfiguration data;
@@ -42,16 +51,23 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
 
         dataFile = new File(getDataFolder(), "data.yml");
         data = YamlConfiguration.loadConfiguration(dataFile);
+        globalEnabled = data.getBoolean("global-enabled", true);
 
         if (Bukkit.getPluginManager().getPlugin("LuckPerms") != null) {
             luckPerms = new LuckPermsHook(this);
             getLogger().info("Hooked into LuckPerms.");
         }
 
+        if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
+            new TotemPlaceholders(this).register();
+            getLogger().info("Registered PlaceholderAPI placeholders.");
+        }
+
         Bukkit.getPluginManager().registerEvents(this, this);
         getCommand("resettotemcounter").setExecutor(this);
+        getCommand("totemcounter").setExecutor(this);
+        getCommand("totemcounter").setTabCompleter(this);
 
-        // Handle players already online (e.g. after /reload)
         for (Player player : Bukkit.getOnlinePlayers()) {
             loadPlayer(player);
             updateDisplay(player);
@@ -64,6 +80,7 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
             savePlayer(player.getUniqueId());
             clearDisplay(player);
         }
+        data.set("global-enabled", globalEnabled);
         saveFile();
     }
 
@@ -91,8 +108,8 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         loadPlayer(player);
-        // Delay one tick so LuckPerms data is loaded
-        Bukkit.getScheduler().runTask(this, () -> updateDisplay(player));
+        // Delay so LuckPerms and other plugins have finished loading the player
+        Bukkit.getScheduler().runTaskLater(this, () -> updateDisplay(player), 10L);
     }
 
     @EventHandler
@@ -102,43 +119,134 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
         saveFile();
         clearDisplay(player);
         counts.remove(player.getUniqueId());
+        hidden.remove(player.getUniqueId());
     }
 
     // ------------------------------------------------------------------
-    // Command
+    // Commands
     // ------------------------------------------------------------------
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!(sender instanceof Player player)) {
-            sender.sendMessage(LEGACY.deserialize(getConfig().getString("messages.player-only", "Players only.")));
+        if (command.getName().equalsIgnoreCase("resettotemcounter")) {
+            if (!(sender instanceof Player player)) {
+                msg(sender, "messages.player-only", "&cOnly players can use this command.");
+                return true;
+            }
+            // Only resets the sender's own counter.
+            counts.put(player.getUniqueId(), 0);
+            updateDisplay(player);
+            msg(player, "messages.reset", "&aYour totem counter has been reset.");
             return true;
         }
 
-        // Only resets the sender's own counter.
-        counts.put(player.getUniqueId(), 0);
-        updateDisplay(player);
-        player.sendMessage(LEGACY.deserialize(getConfig().getString("messages.reset", "&aCounter reset.")));
+        // /totemcounter <toggle|global|reload>
+        String sub = args.length > 0 ? args[0].toLowerCase() : "";
+        switch (sub) {
+            case "toggle" -> {
+                if (!(sender instanceof Player player)) {
+                    msg(sender, "messages.player-only", "&cOnly players can use this command.");
+                    return true;
+                }
+                if (!player.hasPermission("totemcounter.toggle")) {
+                    msg(sender, "messages.no-permission", "&cYou don't have permission.");
+                    return true;
+                }
+                UUID id = player.getUniqueId();
+                if (hidden.remove(id)) {
+                    data.set("hidden." + id, null);
+                    updateDisplay(player);
+                    msg(player, "messages.toggle-on", "&aYour totem counter is now &lvisible&a.");
+                } else {
+                    hidden.add(id);
+                    data.set("hidden." + id, true);
+                    updateDisplay(player);
+                    msg(player, "messages.toggle-off", "&eYour totem counter is now &lhidden&e (still counting).");
+                }
+                saveFile();
+            }
+            case "global" -> {
+                if (!sender.hasPermission("totemcounter.admin")) {
+                    msg(sender, "messages.no-permission", "&cYou don't have permission.");
+                    return true;
+                }
+                globalEnabled = !globalEnabled;
+                data.set("global-enabled", globalEnabled);
+                saveFile();
+                updateAll();
+                msg(sender, globalEnabled ? "messages.global-on" : "messages.global-off",
+                        globalEnabled ? "&aTotem counters are now &lenabled&a for everyone."
+                                      : "&eTotem counters are now &ldisabled&e for everyone.");
+            }
+            case "reload" -> {
+                if (!sender.hasPermission("totemcounter.admin")) {
+                    msg(sender, "messages.no-permission", "&cYou don't have permission.");
+                    return true;
+                }
+                reloadConfig();
+                updateAll();
+                sender.sendMessage(AMP.deserialize("&aTotemCounter config reloaded."));
+            }
+            default -> sender.sendMessage(AMP.deserialize(
+                    "&eUsage: &f/totemcounter <toggle|global|reload>"));
+        }
         return true;
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        List<String> out = new ArrayList<>();
+        if (args.length == 1) {
+            out.add("toggle");
+            if (sender.hasPermission("totemcounter.admin")) {
+                out.add("global");
+                out.add("reload");
+            }
+            out.removeIf(s -> !s.startsWith(args[0].toLowerCase()));
+        }
+        return out;
+    }
+
+    private void msg(CommandSender to, String path, String def) {
+        to.sendMessage(AMP.deserialize(getConfig().getString(path, def)));
     }
 
     // ------------------------------------------------------------------
     // Display
     // ------------------------------------------------------------------
 
+    public boolean isShowing(UUID uuid) {
+        return globalEnabled && !hidden.contains(uuid);
+    }
+
+    public int getCount(UUID uuid) {
+        return counts.getOrDefault(uuid, 0);
+    }
+
+    /** The totem suffix as an &-coded string ("" if hidden/disabled). */
+    public String getTotemSuffix(UUID uuid) {
+        if (!isShowing(uuid)) return "";
+        int count = getCount(uuid);
+        if (count == 0 && getConfig().getBoolean("hide-when-zero", false)) return "";
+        return getConfig().getString("suffix-format", " &e[&6%count%&e]")
+                .replace("%count%", String.valueOf(count));
+    }
+
+    public void updateAll() {
+        for (Player player : Bukkit.getOnlinePlayers()) updateDisplay(player);
+    }
+
     public void updateDisplay(Player player) {
         if (!player.isOnline()) return;
 
-        int count = counts.getOrDefault(player.getUniqueId(), 0);
+        if (!isShowing(player.getUniqueId())) {
+            clearDisplay(player);
+            return;
+        }
 
         String lpPrefix = luckPerms != null ? luckPerms.getPrefix(player) : "";
         String lpSuffix = luckPerms != null ? luckPerms.getSuffix(player) : "";
-
-        String totemPart = "";
-        if (count > 0 || !getConfig().getBoolean("hide-when-zero", false)) {
-            totemPart = getConfig().getString("suffix-format", " &e[&6%count%&e]")
-                    .replace("%count%", String.valueOf(count));
-        }
+        String totemPart = getTotemSuffix(player.getUniqueId());
 
         // Nametag (above head) via a per-player scoreboard team
         if (getConfig().getBoolean("show-on-nametag", true)) {
@@ -148,14 +256,18 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
             if (team == null) team = board.registerNewTeam(teamName);
             if (!team.hasEntry(player.getName())) team.addEntry(player.getName());
 
-            team.prefix(LEGACY.deserialize(lpPrefix));
-            team.suffix(LEGACY.deserialize(lpSuffix + totemPart));
+            team.prefix(AMP.deserialize(lpPrefix));
+            team.suffix(AMP.deserialize(lpSuffix + totemPart));
         }
 
         // Tab list
         if (getConfig().getBoolean("show-on-tablist", true)) {
-            Component tab = LEGACY.deserialize(lpPrefix + player.getName() + lpSuffix + totemPart);
-            player.playerListName(tab);
+            player.playerListName(AMP.deserialize(lpPrefix + player.getName() + lpSuffix + totemPart));
+        }
+
+        // Display name (used by chat and many other plugins)
+        if (getConfig().getBoolean("show-in-chat", true)) {
+            player.displayName(AMP.deserialize(lpPrefix + player.getName() + lpSuffix + totemPart));
         }
     }
 
@@ -164,6 +276,7 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
         Team team = board.getTeam(teamName(player));
         if (team != null) team.unregister();
         player.playerListName(null);
+        player.displayName(null);
     }
 
     private String teamName(Player player) {
@@ -176,7 +289,10 @@ public class TotemCounter extends JavaPlugin implements Listener, CommandExecuto
     // ------------------------------------------------------------------
 
     private void loadPlayer(Player player) {
-        counts.put(player.getUniqueId(), data.getInt("counts." + player.getUniqueId(), 0));
+        UUID id = player.getUniqueId();
+        counts.put(id, data.getInt("counts." + id, 0));
+        if (data.getBoolean("hidden." + id, false)) hidden.add(id);
+        else hidden.remove(id);
     }
 
     private void savePlayer(UUID uuid) {
