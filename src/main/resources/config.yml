@@ -2,18 +2,26 @@
 # Supports & color codes.
 suffix-format: " &e[&6%count%&e]"
 
-# Hide the suffix when a player's count is 0
+# Hide the suffix when the count is 0
 hide-when-zero: false
 
-# Where the suffix is shown
-show-on-nametag: true
-show-on-tablist: true
-# Sets the player's display name, which the default chat and many plugins use.
-# Turn this off if your chat plugin already shows the LuckPerms suffix and you get doubles.
-show-in-chat: true
+# Where the counter is shown. Set to true to turn one on.
+# Everything here is per-player: each player sees counts relative to their own /resettotemcounter.
+display:
+  # Chat messages: <Name [3]> hello
+  chat: false
+  # Tab list. Needs the TAB plugin with %rel_totemcounter_tab% in tabsuffix.
+  tab: false
+  # Nametags above heads. Needs the TAB plugin with %rel_totemcounter_nametag% in tagsuffix.
+  nametag: true
+
+# Built-in nametag / tab list display (no TAB plugin needed).
+# NOTE: these show the SAME number to everyone (not affected by anyone's reset).
+show-on-nametag: false
+show-on-tablist: false
 
 messages:
-  reset: "&aYour totem counter has been reset."
+  reset: "&aReset everyone's totem counter &lfor you&a."
   player-only: "&cOnly players can use this command."
   no-permission: "&cYou don't have permission."
   toggle-on: "&aYour totem counter is now &lvisible&a."
